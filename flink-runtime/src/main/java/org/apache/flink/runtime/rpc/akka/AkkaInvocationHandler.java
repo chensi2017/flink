@@ -26,7 +26,6 @@ import org.apache.flink.runtime.rpc.RpcGateway;
 import org.apache.flink.runtime.rpc.RpcServer;
 import org.apache.flink.runtime.rpc.RpcTimeout;
 import org.apache.flink.runtime.rpc.StartStoppable;
-import org.apache.flink.runtime.rpc.akka.messages.Processing;
 import org.apache.flink.runtime.rpc.exceptions.RpcException;
 import org.apache.flink.runtime.rpc.messages.CallAsync;
 import org.apache.flink.runtime.rpc.messages.LocalRpcInvocation;
@@ -48,6 +47,7 @@ import java.io.IOException;
 import java.lang.annotation.Annotation;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
+import java.util.Arrays;
 import java.util.Objects;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
@@ -91,13 +91,16 @@ class AkkaInvocationHandler implements InvocationHandler, AkkaBasedEndpoint, Rpc
 	@Nullable
 	private final CompletableFuture<Void> terminationFuture;
 
+	private final boolean captureAskCallStack;
+
 	AkkaInvocationHandler(
-			String address,
-			String hostname,
-			ActorRef rpcEndpoint,
-			Time timeout,
-			long maximumFramesize,
-			@Nullable CompletableFuture<Void> terminationFuture) {
+		String address,
+		String hostname,
+		ActorRef rpcEndpoint,
+		Time timeout,
+		long maximumFramesize,
+		@Nullable CompletableFuture<Void> terminationFuture,
+		boolean captureAskCallStack) {
 
 		this.address = Preconditions.checkNotNull(address);
 		this.hostname = Preconditions.checkNotNull(hostname);
@@ -106,6 +109,7 @@ class AkkaInvocationHandler implements InvocationHandler, AkkaBasedEndpoint, Rpc
 		this.timeout = Preconditions.checkNotNull(timeout);
 		this.maximumFramesize = maximumFramesize;
 		this.terminationFuture = terminationFuture;
+		this.captureAskCallStack = captureAskCallStack;
 	}
 
 	@Override
@@ -172,12 +176,12 @@ class AkkaInvocationHandler implements InvocationHandler, AkkaBasedEndpoint, Rpc
 
 	@Override
 	public void start() {
-		rpcEndpoint.tell(Processing.START, ActorRef.noSender());
+		rpcEndpoint.tell(ControlMessages.START, ActorRef.noSender());
 	}
 
 	@Override
 	public void stop() {
-		rpcEndpoint.tell(Processing.STOP, ActorRef.noSender());
+		rpcEndpoint.tell(ControlMessages.STOP, ActorRef.noSender());
 	}
 
 	// ------------------------------------------------------------------------
@@ -209,20 +213,20 @@ class AkkaInvocationHandler implements InvocationHandler, AkkaBasedEndpoint, Rpc
 
 			result = null;
 		} else {
-			// execute an asynchronous call
-			CompletableFuture<?> resultFuture = ask(rpcInvocation, futureTimeout);
+			// Capture the call stack. It is significantly faster to do that via an exception than
+			// via Thread.getStackTrace(), because exceptions lazily initialize the stack trace, initially only
+			// capture a lightweight native pointer, and convert that into the stack trace lazily when needed.
+			final Throwable callStackCapture = captureAskCallStack ? new Throwable() : null;
 
-			CompletableFuture<?> completableFuture = resultFuture.thenApply((Object o) -> {
-				if (o instanceof SerializedValue) {
-					try {
-						return  ((SerializedValue<?>) o).deserializeValue(getClass().getClassLoader());
-					} catch (IOException | ClassNotFoundException e) {
-						throw new CompletionException(
-							new RpcException("Could not deserialize the serialized payload of RPC method : "
-								+ methodName, e));
-					}
+			// execute an asynchronous call
+			final CompletableFuture<?> resultFuture = ask(rpcInvocation, futureTimeout);
+
+			final CompletableFuture<Object> completableFuture = new CompletableFuture<>();
+			resultFuture.whenComplete((resultValue, failure) -> {
+				if (failure != null) {
+					completableFuture.completeExceptionally(resolveTimeoutException(failure, callStackCapture, method));
 				} else {
-					return o;
+					completableFuture.complete(deserializeValueIfNeeded(resultValue, method));
 				}
 			});
 
@@ -268,7 +272,10 @@ class AkkaInvocationHandler implements InvocationHandler, AkkaBasedEndpoint, Rpc
 					args);
 
 				if (remoteRpcInvocation.getSize() > maximumFramesize) {
-					throw new IOException("The rpc invocation size exceeds the maximum akka framesize.");
+					throw new IOException(
+						String.format(
+							"The rpc invocation size %d exceeds the maximum akka framesize.",
+							remoteRpcInvocation.getSize()));
 				} else {
 					rpcInvocation = remoteRpcInvocation;
 				}
@@ -367,5 +374,36 @@ class AkkaInvocationHandler implements InvocationHandler, AkkaBasedEndpoint, Rpc
 	@Override
 	public CompletableFuture<Void> getTerminationFuture() {
 		return terminationFuture;
+	}
+
+	static Object deserializeValueIfNeeded(Object o, Method method) {
+		if (o instanceof SerializedValue) {
+			try {
+				return  ((SerializedValue<?>) o).deserializeValue(AkkaInvocationHandler.class.getClassLoader());
+			} catch (IOException | ClassNotFoundException e) {
+				throw new CompletionException(
+					new RpcException(
+						"Could not deserialize the serialized payload of RPC method : " + method.getName(), e));
+			}
+		} else {
+			return o;
+		}
+	}
+
+	static Throwable resolveTimeoutException(Throwable exception, @Nullable Throwable callStackCapture, Method method) {
+		if (!(exception instanceof akka.pattern.AskTimeoutException)) {
+			return exception;
+		}
+
+		final TimeoutException newException = new TimeoutException("Invocation of " + method + " timed out.");
+		newException.initCause(exception);
+
+		if (callStackCapture != null) {
+			// remove the stack frames coming from the proxy interface invocation
+			final StackTraceElement[] stackTrace = callStackCapture.getStackTrace();
+			newException.setStackTrace(Arrays.copyOfRange(stackTrace, 3, stackTrace.length));
+		}
+
+		return newException;
 	}
 }

@@ -21,6 +21,7 @@ package org.apache.flink.runtime.rpc.akka;
 import org.apache.flink.api.common.time.Time;
 import org.apache.flink.configuration.AkkaOptions;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.runtime.rpc.RpcEndpoint;
 import org.apache.flink.runtime.rpc.RpcGateway;
 import org.apache.flink.runtime.rpc.RpcService;
 import org.apache.flink.runtime.rpc.RpcUtils;
@@ -83,6 +84,7 @@ public class AkkaRpcActorOversizedResponseMessageTest extends TestLogger {
 			fail("Expected the RPC to fail.");
 		} catch (ExecutionException e) {
 			assertThat(ExceptionUtils.findThrowable(e, AkkaRpcException.class).isPresent(), is(true));
+			assertThat(e.getCause().getMessage().contains(String.valueOf(FRAMESIZE)), is(true));
 		}
 	}
 
@@ -106,6 +108,7 @@ public class AkkaRpcActorOversizedResponseMessageTest extends TestLogger {
 			fail("Expected the RPC to fail.");
 		} catch (RpcException e) {
 			assertThat(ExceptionUtils.findThrowable(e, AkkaRpcException.class).isPresent(), is(true));
+			assertThat(e.getCause().getMessage().contains(String.valueOf(FRAMESIZE)), is(true));
 		}
 	}
 
@@ -170,7 +173,7 @@ public class AkkaRpcActorOversizedResponseMessageTest extends TestLogger {
 		String messageSync() throws RpcException;
 	}
 
-	static class MessageRpcEndpoint extends TestRpcEndpoint implements MessageRpcGateway {
+	static class MessageRpcEndpoint extends RpcEndpoint implements MessageRpcGateway {
 
 		@Nonnull
 		private final String message;
@@ -189,6 +192,5 @@ public class AkkaRpcActorOversizedResponseMessageTest extends TestLogger {
 		public String messageSync() throws RpcException {
 			return message;
 		}
-
 	}
 }
